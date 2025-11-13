@@ -8,34 +8,44 @@ const Home = () => {
   const [toDoList, setToDoList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
-  const getToDoList = useCallback(async () => {
-    const res = await fetch(`${BASE_URL}/todos/user/${username}`);
+
+  // ===== API HELPERS =====
+
+  // Read user + todos
+  const getUser = useCallback(async () => {
+    const res = await fetch(`${BASE_URL}/users/${username}`);
+
+    // user doesn't exist yet
     if (res.status === 404) return null;
+
     if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-    return res.json(); // usually an array of {label, done}
+    return res.json();
   }, []);
 
-  // POST create empty user list
+  // Create user (empty)
   const createUser = useCallback(async () => {
-    const res = await fetch(`${BASE_URL}/todos/user/${username}`, {
+    const res = await fetch(`${BASE_URL}/users/${username}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify([]),
     });
     if (!res.ok) throw new Error(`Create user failed: ${res.status}`);
     return res.json();
   }, []);
 
-  // PUT replace the entire list
-  const saveToDoList = useCallback(async (list) => {
-    const res = await fetch(`${BASE_URL}/todos/user/${username}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(list), // list is an array of { label, done }
-    });
-    if (!res.ok) throw new Error(`Save failed: ${res.status}`);
-    return res.json();
-  }, []);
+  const normalizeList = (data) =>
+    Array.isArray(data?.todos) ? data.todos : Array.isArray(data) ? data : [];
+
+  const reloadFromServer = useCallback(async () => {
+    try {
+      const data = await getUser();
+      const list = normalizeList(data || {});
+      setToDoList(list);
+    } catch (e) {
+      console.error(e);
+      setErr("Could not reload tasks from server.");
+    }
+  }, [getUser]);
+
+  // ===== LOAD ON START =====
 
   useEffect(() => {
     (async () => {
@@ -43,18 +53,15 @@ const Home = () => {
         setLoading(true);
         setErr("");
 
-        let data = await getToDoList();
+        let data = await getUser();
+
+        // If the user doesn't exist, create them and fetch again
         if (data === null) {
           await createUser();
-          data = [];
+          data = await getUser();
         }
 
-        // handle either [] or { result: [...] }
-        const list = Array.isArray(data)
-          ? data
-          : Array.isArray(data?.result)
-          ? data.result
-          : [];
+        const list = normalizeList(data);
         setToDoList(list);
       } catch (e) {
         console.error(e);
@@ -63,44 +70,86 @@ const Home = () => {
         setLoading(false);
       }
     })();
-  }, [getToDoList, createUser, setLoading, setToDoList]);
+  }, [getUser, createUser]);
+
+  // ===== ADD TASK (POST /todos/{username}, then GET /users/{username}) =====
 
   const addTask = async (e) => {
     e.preventDefault();
     const value = inputValue.trim();
     if (!value) return;
 
-    const updated = [...toDoList, { label: value, done: false }];
-    setToDoList(updated);
+    setErr("");
+
+    // Optional optimistic UI
+    const tempTask = {
+      id: crypto.randomUUID(),
+      label: value,
+      done: false,
+    };
+    setToDoList((prev) => [...prev, tempTask]);
     setInputValue("");
+
     try {
-      await saveToDoList(updated);
-    } catch {
+      const taskToSend = { label: value, done: false };
+
+      const res = await fetch(`${BASE_URL}/todos/${username}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(taskToSend),
+      });
+
+      if (!res.ok) throw new Error(`Add task failed: ${res.status}`);
+
+      await reloadFromServer(); // sync with backend
+    } catch (e) {
+      console.error(e);
       setErr("Could not save the new task.");
     }
   };
-  const removeTask = async (index) => {
-    const updated = toDoList.filter((_, i) => i !== index);
-    setToDoList(updated);
+
+  // ===== DELETE SINGLE TASK (DELETE /todos/{todo_id}, then GET) =====
+
+  const removeTask = async (todoId) => {
+    setErr("");
+
+    // optimistic UI
+    setToDoList((prev) => prev.filter((t) => t.id !== todoId));
+
     try {
-      await saveToDoList(updated);
-    } catch {
+      const res = await fetch(`${BASE_URL}/todos/${todoId}`, {
+        method: "DELETE",
+      });
+
+      if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
+
+      await reloadFromServer();
+    } catch (e) {
+      console.error(e);
       setErr("Could not delete the task.");
     }
   };
 
+  // ===== CLEAR ALL TASKS (DELETE each /todos/{id}) =====
+
   const clearAll = async () => {
+    setErr("");
+
     try {
-      const res = await fetch(`${BASE_URL}/todo${toDoList}`, {
-        method: "DELETE",
-      });
-      if (!res.ok) throw new Error(`Delete failed: ${res.status}`);
+      await Promise.all(
+        toDoList.map((item) =>
+          fetch(`${BASE_URL}/todos/${item.id}`, { method: "DELETE" })
+        )
+      );
+
       setToDoList([]);
     } catch (e) {
       console.error(e);
       setErr("Could not clear tasks.");
     }
   };
+
+  // ===== UI =====
 
   return (
     <div className="container" style={{ maxWidth: 560 }}>
@@ -120,18 +169,19 @@ const Home = () => {
       {err && <div className="text-danger mb-2">{err}</div>}
 
       <ul className="list-group">
-        {toDoList.map((item, index) => (
+        {toDoList.map((item) => (
           <li
             className="list-group-item d-flex justify-content-between align-items-center"
-            key={index}
+            key={item.id ?? item.label}
           >
             <span>{item.label ?? String(item)}</span>
-            <i
-              className="fa-solid fa-trash-can"
-              role="button"
-              onClick={() => removeTask(index)}
-              title="Remove task"
-            />
+            <button
+              type="button"
+              className="btn btn-sm btn-outline-danger"
+              onClick={() => removeTask(item.id)}
+            >
+              Delete
+            </button>
           </li>
         ))}
         {toDoList.length === 0 && !loading && (
